@@ -178,24 +178,120 @@ async function hashString(str: string): Promise<string> {
 	return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+export interface OrganizationMembership {
+	id: string;
+	organization_id: string;
+	organization_name: string;
+	organization_slug: string;
+	logo_url: string | null;
+	role: 'owner' | 'admin' | 'member';
+}
+
+export interface CurrentUserSession {
+	id: string;
+	userId: string;
+	organizations: OrganizationMembership[];
+}
+
+/**
+ * Get all organizations a user belongs to with their role
+ */
+export async function getUserOrganizations(
+	db: D1Database,
+	userId: string
+): Promise<OrganizationMembership[]> {
+	try {
+		const result = await db
+			.prepare(
+				`SELECT m.id, m.organization_id, o.name as organization_name, o.slug as organization_slug, o.logo_url, m.role
+				FROM organization_members m
+				JOIN organizations o ON m.organization_id = o.id
+				WHERE m.user_id = ?`
+			)
+			.bind(userId)
+			.all<OrganizationMembership>();
+		return result.results || [];
+	} catch (err) {
+		console.error('Failed to get user organizations:', err);
+		return [];
+	}
+}
+
 /**
  * Get current user from session cookie
  */
+export async function getCurrentUser(event: RequestEvent): Promise<string | null>;
+export async function getCurrentUser(event: RequestEvent, withOrgs: true): Promise<CurrentUserSession | null>;
 export async function getCurrentUser(
-	event: RequestEvent
-): Promise<string | null> {
+	event: RequestEvent,
+	withOrgs?: boolean
+): Promise<string | CurrentUserSession | null> {
+	const env = event.platform?.env;
+	const jwtSecret = env?.JWT_SECRET;
+	const cronSecret = env?.CRON_SECRET;
+
+	// 1. Check for Machine-to-Machine API Key (for CRM integration)
+	const apiKeyHeader = event.request.headers.get('x-api-key');
+	const authHeader = event.request.headers.get('authorization');
+	const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : null;
+	const providedKey = apiKeyHeader || bearerToken;
+
+	if (providedKey && jwtSecret && (providedKey === jwtSecret || (cronSecret && providedKey === cronSecret))) {
+		const db = env?.DB;
+		const requestedUserId = event.request.headers.get('x-user-id');
+		let effectiveUserId = requestedUserId;
+
+		if (!effectiveUserId && db) {
+			const adminUser = await db.prepare('SELECT id FROM users ORDER BY created_at ASC LIMIT 1').first<{ id: string }>();
+			effectiveUserId = adminUser?.id || 'system-admin';
+		}
+
+		if (!withOrgs) {
+			return effectiveUserId || 'system-admin';
+		}
+
+		const organizations = db && effectiveUserId ? await getUserOrganizations(db, effectiveUserId) : [];
+		return {
+			id: effectiveUserId || 'system-admin',
+			userId: effectiveUserId || 'system-admin',
+			organizations
+		};
+	}
+
+	// 2. Check for browser user session cookie
 	const sessionToken = event.cookies.get('session');
 	if (!sessionToken) {
 		return null;
 	}
 
-	const jwtSecret = event.platform?.env?.JWT_SECRET;
 	if (!jwtSecret) {
 		return null;
 	}
 
 	const session = await verifySessionToken(sessionToken, jwtSecret);
-	return session?.userId ?? null;
+	if (!session?.userId) {
+		return null;
+	}
+
+	if (!withOrgs) {
+		return session.userId;
+	}
+
+	const db = env?.DB;
+	const organizations = db ? await getUserOrganizations(db, session.userId) : [];
+
+	return {
+		id: session.userId,
+		userId: session.userId,
+		organizations
+	};
+}
+
+/**
+ * Convenience helper to get current user with organizations
+ */
+export async function getCurrentUserWithOrgs(event: RequestEvent): Promise<CurrentUserSession | null> {
+	return getCurrentUser(event, true);
 }
 
 /**

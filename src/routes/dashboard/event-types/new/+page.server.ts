@@ -4,7 +4,7 @@
 
 import { redirect, fail } from '@sveltejs/kit';
 import type { PageServerLoad, Actions } from './$types';
-import { getCurrentUser } from '$lib/server/auth';
+import { getCurrentUser, getUserOrganizations } from '$lib/server/auth';
 import { validateLength, validateFields, MAX_LENGTHS } from '$lib/server/validation';
 
 export const load: PageServerLoad = async (event) => {
@@ -21,7 +21,8 @@ export const load: PageServerLoad = async (event) => {
 			outlookConnected: false,
 			outlookConfigured: false,
 			defaultAvailabilityCalendars: undefined,
-			defaultInviteCalendar: undefined
+			defaultInviteCalendar: undefined,
+			meetingRooms: []
 		};
 	}
 
@@ -45,12 +46,25 @@ export const load: PageServerLoad = async (event) => {
 		userSettings = {};
 	}
 
+	// Get organization meeting rooms if user belongs to an org
+	const orgs = await getUserOrganizations(db, userId);
+	const currentOrg = orgs.length > 0 ? orgs[0] : null;
+	let meetingRooms: Array<{ id: string; name: string; location: string | null; capacity: number }> = [];
+	if (currentOrg) {
+		const roomsQuery = await db
+			.prepare('SELECT id, name, location, capacity FROM meeting_rooms WHERE organization_id = ? AND is_active = 1 ORDER BY name ASC')
+			.bind(currentOrg.organization_id)
+			.all<{ id: string; name: string; location: string | null; capacity: number }>();
+		meetingRooms = roomsQuery.results || [];
+	}
+
 	return {
 		googleConnected: !!user?.google_refresh_token,
 		outlookConnected: !!user?.outlook_refresh_token,
 		outlookConfigured,
 		defaultAvailabilityCalendars: userSettings.defaultAvailabilityCalendars,
-		defaultInviteCalendar: userSettings.defaultInviteCalendar
+		defaultInviteCalendar: userSettings.defaultInviteCalendar,
+		meetingRooms
 	};
 };
 
@@ -78,6 +92,8 @@ export const actions: Actions = {
 		// Only use custom values if override is enabled, otherwise null (use global)
 		const availabilityCalendars = overrideCalendarSettings ? (formData.get('availability_calendars') || 'both') : null;
 		const inviteCalendar = overrideCalendarSettings ? (formData.get('invite_calendar') || 'google') : null;
+		const locationType = (formData.get('location_type') || 'google_meet').toString();
+		const meetingRoomId = locationType === 'in_person' ? (formData.get('meeting_room_id')?.toString() || null) : null;
 
 		if (!name || !slug || !duration) {
 			return fail(400, { error: 'Missing required fields' });
@@ -110,13 +126,33 @@ export const actions: Actions = {
 				return fail(400, { error: 'An event type with this slug already exists' });
 			}
 
+			// Get organization id if user has one
+			const orgs = await getUserOrganizations(db, userId);
+			const currentOrg = orgs.length > 0 ? orgs[0] : null;
+
 			// Insert new event type
 			await db
 				.prepare(
-					`INSERT INTO event_types (user_id, name, slug, duration_minutes, description, is_active, cover_image, availability_calendars, invite_calendar, created_at)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+					`INSERT INTO event_types (
+						user_id, organization_id, meeting_room_id, name, slug, duration_minutes,
+						description, location_type, is_active, cover_image,
+						availability_calendars, invite_calendar, created_at
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
 				)
-				.bind(userId, name, slugStr, parseInt(duration.toString()), description, isActive ? 1 : 0, coverImage, availabilityCalendars, inviteCalendar)
+				.bind(
+					userId,
+					currentOrg?.organization_id || null,
+					meetingRoomId,
+					name,
+					slugStr,
+					parseInt(duration.toString()),
+					description,
+					locationType,
+					isActive ? 1 : 0,
+					coverImage,
+					availabilityCalendars,
+					inviteCalendar
+				)
 				.run();
 
 			throw redirect(302, '/dashboard');

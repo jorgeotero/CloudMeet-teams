@@ -6,6 +6,7 @@
 import { json, error, type RequestEvent } from '@sveltejs/kit';
 import { getCurrentUser } from '$lib/server/auth';
 import { getEmailTemplates, isEmailEnabled } from '$lib/server/email';
+import { queueWebhookEvent } from '$lib/server/webhooks';
 
 export const POST = async (event: RequestEvent) => {
 	const env = event.platform?.env;
@@ -38,8 +39,9 @@ export const POST = async (event: RequestEvent) => {
 		// Get booking and verify ownership
 		const booking = await db
 			.prepare(
-				`SELECT b.id, b.user_id, b.status, b.start_time, b.end_time,
-				b.attendee_name, b.attendee_email, b.attendee_notes,
+				`SELECT b.id, b.user_id, b.event_type_id, b.status, b.start_time, b.end_time,
+				b.attendee_name, b.attendee_email, b.attendee_phone, b.attendee_notes,
+				b.external_ref, b.metadata, b.meeting_url,
 				e.name as event_name, e.slug as event_slug,
 				u.name as host_name, u.email as host_email, u.contact_email, u.settings, u.brand_color
 				FROM bookings b
@@ -51,12 +53,17 @@ export const POST = async (event: RequestEvent) => {
 			.first<{
 				id: string;
 				user_id: string;
+				event_type_id: string;
 				status: string;
 				start_time: string;
 				end_time: string;
 				attendee_name: string;
 				attendee_email: string;
+				attendee_phone: string | null;
 				attendee_notes: string | null;
+				external_ref: string | null;
+				metadata: string | null;
+				meeting_url: string | null;
 				event_name: string;
 				event_slug: string;
 				host_name: string;
@@ -96,6 +103,30 @@ export const POST = async (event: RequestEvent) => {
 			.prepare(`UPDATE bookings SET status = 'rescheduled' WHERE id = ?`)
 			.bind(bookingId)
 			.run();
+
+		// Dispatch booking.proposal_sent webhook event
+		queueWebhookEvent(event.platform, db, booking.user_id, 'booking.proposal_sent', {
+			id: booking.id,
+			proposal_id: responseToken,
+			event_type_id: booking.event_type_id,
+			event_slug: booking.event_slug,
+			user_id: booking.user_id,
+			host_email: booking.host_email,
+			start_time: proposedStartTime,
+			end_time: proposedEndTime,
+			original_start_time: booking.start_time,
+			original_end_time: booking.end_time,
+			attendee_name: booking.attendee_name,
+			attendee_email: booking.attendee_email,
+			attendee_phone: booking.attendee_phone,
+			attendee_notes: booking.attendee_notes,
+			external_ref: booking.external_ref,
+			metadata: booking.metadata,
+			meeting_url: booking.meeting_url,
+			status: 'proposal_sent',
+			proposed_by: 'host',
+			message: message || null
+		});
 
 		// Send email to attendee with proposal
 		if (env.EMAILIT_API_KEY) {
@@ -271,7 +302,7 @@ async function sendRescheduleProposalEmail(data: RescheduleProposalEmailData, co
 </html>
 	`;
 
-	const response = await fetch('https://api.emailit.com/v1/emails', {
+	const response = await fetch('https://api.emailit.com/v2/emails', {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',

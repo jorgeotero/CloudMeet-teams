@@ -93,3 +93,29 @@ export class KVCache {
 		}
 	}
 }
+
+/**
+ * Invalidate both daily and monthly availability KV caches for a given user, event, and date.
+ * Deletes:
+ *   - availability:${userId}:${eventSlug}:${dateStr} (YYYY-MM-DD)
+ *   - availability:month:${userId}:${eventSlug}:${monthStr} (YYYY-MM)
+ */
+export async function invalidateAvailabilityCache(
+	kv: KVNamespace | undefined | null,
+	userId: string,
+	eventSlug: string,
+	dateIso: string
+): Promise<void> {
+	if (!kv || !userId || !eventSlug || !dateIso) return;
+	const dateStr = dateIso.includes('T') ? dateIso.split('T')[0] : dateIso.slice(0, 10);
+	const monthStr = dateStr.slice(0, 7); // YYYY-MM
+
+	try {
+		await Promise.all([
+			kv.delete(`availability:${userId}:${eventSlug}:${dateStr}`),
+			kv.delete(`availability:month:${userId}:${eventSlug}:${monthStr}`)
+		]);
+	} catch (error) {
+		console.error(`Failed to invalidate availability cache for ${userId}:${eventSlug}:${dateStr}`, error);
+	}
+}

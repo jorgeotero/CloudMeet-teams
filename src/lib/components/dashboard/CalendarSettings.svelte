@@ -59,7 +59,7 @@
 		try {
 			const response = await fetch('/api/calendars/google');
 			if (response.ok) {
-				const data = await response.json();
+				const data = (await response.json()) as { calendars: GoogleCalendar[] };
 				googleCalendars = data.calendars;
 				// If no calendars selected yet, select all by default
 				if (selectedCalendarIds.size === 0 && googleCalendars.length > 0) {

@@ -13,6 +13,8 @@
 	let coverImage = $state('');
 	let saving = $state(false);
 	let uploadingCover = $state(false);
+	let locationType = $state<'google_meet' | 'ms_teams' | 'in_person'>('google_meet');
+	let meetingRoomId = $state('');
 
 	// Check which calendars are available
 	const hasGoogle = data.googleConnected;
@@ -196,6 +198,56 @@
 							placeholder="Describe what this meeting is for..."
 						/>
 						<input type="hidden" name="description" value={description} />
+					</div>
+
+					<!-- Location / Meeting Format -->
+					<div>
+						<label for="location_type" class="block text-sm font-medium text-gray-700 mb-2">
+							Location / Meeting Format
+						</label>
+						<select
+							id="location_type"
+							name="location_type"
+							bind:value={locationType}
+							class="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm"
+						>
+							<option value="google_meet">Google Meet (Online)</option>
+							<option value="ms_teams">Microsoft Teams (Online)</option>
+							<option value="in_person">In-Person / Meeting Room (Physical)</option>
+						</select>
+						<p class="text-xs text-gray-500 mt-1">
+							Choose whether this meeting occurs online via video link or in a physical room.
+						</p>
+
+						{#if locationType === 'in_person'}
+							<div class="mt-3 p-4 bg-blue-50/60 border border-blue-200 rounded-lg space-y-2">
+								<label for="meeting_room_id" class="block text-xs font-semibold text-blue-900">
+									Reserve Physical Meeting Room
+								</label>
+								{#if data.meetingRooms && data.meetingRooms.length > 0}
+									<select
+										id="meeting_room_id"
+										name="meeting_room_id"
+										bind:value={meetingRoomId}
+										class="w-full px-3 py-2 bg-white border border-blue-300 rounded-md text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+									>
+										<option value="">-- No specific room reserved --</option>
+										{#each data.meetingRooms as room}
+											<option value={room.id}>
+												{room.name} {room.location ? `(${room.location})` : ''} - Cap: {room.capacity}
+											</option>
+										{/each}
+									</select>
+									<p class="text-xs text-blue-700">
+										When booked, CloudMeet will automatically block this room across all team members to prevent double-booking.
+									</p>
+								{:else}
+									<p class="text-xs text-amber-800 bg-amber-50 p-2.5 rounded border border-amber-200">
+										No active meeting rooms found for your organization. You can create conference rooms in the <a href="/dashboard" class="underline font-semibold">Meeting Rooms</a> tab.
+									</p>
+								{/if}
+							</div>
+						{/if}
 					</div>
 
 					<!-- Cover Image -->

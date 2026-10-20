@@ -9,8 +9,10 @@ export const onRequest: PagesFunction = async (context) => {
 	const response = await next();
 	const headers = new Headers(response.headers);
 
-	// Security headers
-	headers.set('X-Frame-Options', 'DENY');
+	// Security headers: allow iframe embedding on public booking routes, restrict on dashboard/auth
+	if (path.startsWith('/dashboard') || path.startsWith('/auth')) {
+		headers.set('X-Frame-Options', 'SAMEORIGIN');
+	}
 	headers.set('X-Content-Type-Options', 'nosniff');
 	headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
 

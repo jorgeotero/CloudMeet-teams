@@ -5,7 +5,7 @@
 		slug: string;
 		duration: number;
 		description?: string | null;
-		is_active: boolean;
+		is_active: boolean | number;
 	}
 
 	interface Props {

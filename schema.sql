@@ -19,10 +19,64 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE INDEX idx_users_slug ON users(slug);
 CREATE INDEX idx_users_email ON users(email);
 
+-- Organizations (Teams/Workspaces)
+CREATE TABLE IF NOT EXISTS organizations (
+    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    name TEXT NOT NULL,
+    slug TEXT UNIQUE NOT NULL,
+    logo_url TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_organizations_slug ON organizations(slug);
+
+-- Organization members
+CREATE TABLE IF NOT EXISTS organization_members (
+    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK(role IN ('owner', 'admin', 'member')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(organization_id, user_id)
+);
+
+CREATE INDEX idx_org_members_user ON organization_members(user_id);
+CREATE INDEX idx_org_members_org ON organization_members(organization_id);
+
+-- Organization invitations
+CREATE TABLE IF NOT EXISTS organization_invitations (
+    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('owner', 'admin', 'member')),
+    token TEXT UNIQUE NOT NULL,
+    expires_at DATETIME NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(organization_id, email)
+);
+
+CREATE INDEX idx_org_invitations_email ON organization_invitations(email);
+CREATE INDEX idx_org_invitations_token ON organization_invitations(token);
+
+-- Offline Meeting Rooms per Organization
+CREATE TABLE IF NOT EXISTS meeting_rooms (
+    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    location TEXT,
+    capacity INTEGER DEFAULT 4,
+    is_active INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_meeting_rooms_org ON meeting_rooms(organization_id);
+
 -- Event types (different meeting types a user can offer)
 CREATE TABLE IF NOT EXISTS event_types (
     id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
     user_id TEXT NOT NULL,
+    organization_id TEXT,
+    meeting_room_id TEXT,
     name TEXT NOT NULL,
     duration_minutes INTEGER NOT NULL DEFAULT 30,
     buffer_minutes INTEGER DEFAULT 0,
@@ -37,11 +91,15 @@ CREATE TABLE IF NOT EXISTS event_types (
     invite_calendar TEXT DEFAULT 'google', -- 'google' or 'outlook'
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE SET NULL,
+    FOREIGN KEY (meeting_room_id) REFERENCES meeting_rooms(id) ON DELETE SET NULL,
     UNIQUE(user_id, slug)
 );
 
 CREATE INDEX idx_event_types_user ON event_types(user_id);
 CREATE INDEX idx_event_types_active ON event_types(user_id, is_active);
+CREATE INDEX idx_event_types_org ON event_types(organization_id);
+CREATE INDEX idx_event_types_room ON event_types(meeting_room_id);
 
 -- Availability rules (recurring weekly schedule)
 CREATE TABLE IF NOT EXISTS availability_rules (
@@ -80,11 +138,16 @@ CREATE TABLE IF NOT EXISTS bookings (
     id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
     event_type_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
+    organization_id TEXT,
+    meeting_room_id TEXT,
     start_time DATETIME NOT NULL,
     end_time DATETIME NOT NULL,
     attendee_name TEXT NOT NULL,
     attendee_email TEXT NOT NULL,
+    attendee_phone TEXT,
     attendee_notes TEXT,
+    external_ref TEXT,
+    metadata TEXT, -- JSON string of extra context/UTM parameters
     google_event_id TEXT,
     outlook_event_id TEXT,
     meeting_url TEXT,
@@ -94,13 +157,17 @@ CREATE TABLE IF NOT EXISTS bookings (
     cancellation_reason TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (event_type_id) REFERENCES event_types(id),
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE SET NULL,
+    FOREIGN KEY (meeting_room_id) REFERENCES meeting_rooms(id) ON DELETE SET NULL
 );
 
 CREATE INDEX idx_bookings_user_time ON bookings(user_id, start_time);
 CREATE INDEX idx_bookings_event_type ON bookings(event_type_id);
 CREATE INDEX idx_bookings_status ON bookings(status);
 CREATE INDEX idx_bookings_google_event ON bookings(google_event_id);
+CREATE INDEX idx_bookings_org ON bookings(organization_id);
+CREATE INDEX idx_bookings_room ON bookings(meeting_room_id);
 
 -- Cache control table (fallback when KV is unavailable)
 CREATE TABLE IF NOT EXISTS cache_control (

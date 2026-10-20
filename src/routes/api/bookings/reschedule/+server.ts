@@ -6,7 +6,10 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { createCalendarEvent, cancelCalendarEvent, getValidAccessToken } from '$lib/server/google-calendar';
+import { createOutlookCalendarEvent, cancelOutlookCalendarEvent, getValidOutlookAccessToken } from '$lib/server/outlook-calendar';
 import { sendRescheduleEmail, sendAdminRescheduleNotification, getEmailTemplates, isEmailEnabled } from '$lib/server/email';
+import { invalidateAvailabilityCache } from '$lib/cache/kv-cache';
+import { queueWebhookEvent } from '$lib/server/webhooks';
 
 export const POST: RequestHandler = async ({ request, platform }) => {
 	const env = platform?.env;
@@ -33,12 +36,13 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 		// Get the original booking with all details
 		const originalBooking = await db
 			.prepare(
-				`SELECT b.id, b.user_id, b.event_type_id, b.start_time, b.end_time,
-				b.attendee_name, b.attendee_email, b.attendee_notes, b.google_event_id,
+				`SELECT b.id, b.user_id, b.event_type_id, b.meeting_room_id, b.start_time, b.end_time,
+				b.attendee_name, b.attendee_email, b.attendee_phone, b.attendee_notes,
+				b.external_ref, b.metadata, b.google_event_id, b.outlook_event_id,
 				e.name as event_name, e.slug as event_slug, e.description as event_description,
-				e.duration_minutes as duration,
+				e.duration_minutes as duration, e.buffer_minutes,
 				u.id as host_user_id, u.name as host_name, u.email as host_email,
-				u.contact_email, u.settings, u.brand_color
+				u.contact_email, u.settings, u.brand_color, u.outlook_refresh_token
 				FROM bookings b
 				JOIN event_types e ON b.event_type_id = e.id
 				JOIN users u ON b.user_id = u.id
@@ -49,22 +53,29 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 				id: string;
 				user_id: string;
 				event_type_id: string;
+				meeting_room_id: string | null;
 				start_time: string;
 				end_time: string;
 				attendee_name: string;
 				attendee_email: string;
+				attendee_phone: string | null;
 				attendee_notes: string | null;
+				external_ref: string | null;
+				metadata: string | null;
 				google_event_id: string | null;
+				outlook_event_id: string | null;
 				event_name: string;
 				event_slug: string;
 				event_description: string | null;
 				duration: number;
+				buffer_minutes: number | null;
 				host_user_id: string;
 				host_name: string;
 				host_email: string;
 				contact_email: string | null;
 				settings: string | null;
 				brand_color: string | null;
+				outlook_refresh_token: string | null;
 			}>();
 
 		if (!originalBooking) {
@@ -76,23 +87,23 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 		const oldStartDateTime = new Date(originalBooking.start_time);
 		const oldEndDateTime = new Date(originalBooking.end_time);
 
-		// Check for conflicts with existing bookings (excluding the original booking)
+		// Check for conflicts with existing bookings (excluding the original booking), respecting buffer_minutes
+		const bufferMinutes = originalBooking.buffer_minutes || 0;
+		const bufferMs = bufferMinutes * 60 * 1000;
+		const bufferedStartTime = new Date(newStartDateTime.getTime() - bufferMs).toISOString();
+		const bufferedEndTime = new Date(newEndDateTime.getTime() + bufferMs).toISOString();
+
 		const conflict = await db
 			.prepare(
 				`SELECT id FROM bookings
 				WHERE user_id = ? AND status = 'confirmed' AND id != ?
-				AND (
-					(start_time <= ? AND end_time > ?)
-					OR (start_time < ? AND end_time >= ?)
-					OR (start_time >= ? AND end_time <= ?)
-				)`
+				AND start_time < ? AND end_time > ?`
 			)
 			.bind(
 				originalBooking.user_id,
 				bookingId,
-				newStartTime, newStartTime,
-				newEndTime, newEndTime,
-				newStartTime, newEndTime
+				bufferedEndTime,
+				bufferedStartTime
 			)
 			.first();
 
@@ -100,56 +111,115 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 			throw error(409, 'This time slot is no longer available');
 		}
 
-		// Cancel old Google Calendar event and create new one
+		// Check room conflict if booking has an assigned meeting room
+		if (originalBooking.meeting_room_id) {
+			const roomConflict = await db
+				.prepare(
+					`SELECT id FROM bookings
+					WHERE meeting_room_id = ? AND status = 'confirmed' AND id != ?
+					AND start_time < ? AND end_time > ?`
+				)
+				.bind(
+					originalBooking.meeting_room_id,
+					bookingId,
+					bufferedEndTime,
+					bufferedStartTime
+				)
+				.first();
+
+			if (roomConflict) {
+				throw error(409, 'The meeting room is no longer available for this time slot');
+			}
+		}
+
 		let newCalendarEventId: string | null = null;
+		let newOutlookEventId: string | null = null;
 		let newMeetingUrl: string | null = null;
 
-		try {
-			const accessToken = await getValidAccessToken(
-				db,
-				originalBooking.user_id,
-				env.GOOGLE_CLIENT_ID,
-				env.GOOGLE_CLIENT_SECRET
-			);
+		// Cancel old Google Calendar event and create new one if Google was used
+		if (originalBooking.google_event_id) {
+			try {
+				const accessToken = await getValidAccessToken(
+					db,
+					originalBooking.user_id,
+					env.GOOGLE_CLIENT_ID,
+					env.GOOGLE_CLIENT_SECRET
+				);
 
-			// Cancel old calendar event if it exists
-			if (originalBooking.google_event_id) {
+				// Cancel old calendar event if it exists
 				try {
 					await cancelCalendarEvent(accessToken, originalBooking.google_event_id);
 				} catch (err) {
 					console.error('Error cancelling old Google Calendar event:', err);
 				}
-			}
 
-			// Create new calendar event
-			const notes = originalBooking.attendee_notes;
-			const calendarEvent = await createCalendarEvent(accessToken, {
-				summary: `${originalBooking.event_name} with ${originalBooking.attendee_name}`,
-				description: `${originalBooking.event_description || ''}\n\nAttendee: ${originalBooking.attendee_name} (${originalBooking.attendee_email})${notes ? `\n\nNotes from attendee:\n${notes}` : ''}`,
-				start: {
-					dateTime: newStartDateTime.toISOString(),
-					timeZone: 'UTC'
-				},
-				end: {
-					dateTime: newEndDateTime.toISOString(),
-					timeZone: 'UTC'
-				},
-				attendees: [
-					{ email: originalBooking.attendee_email }
-				],
-				conferenceData: {
-					createRequest: {
-						requestId: crypto.randomUUID(),
-						conferenceSolutionKey: { type: 'hangoutsMeet' }
+				// Create new calendar event
+				const notes = originalBooking.attendee_notes;
+				const calendarEvent = await createCalendarEvent(accessToken, {
+					summary: `${originalBooking.event_name} with ${originalBooking.attendee_name}`,
+					description: `${originalBooking.event_description || ''}\n\nAttendee: ${originalBooking.attendee_name} (${originalBooking.attendee_email})${notes ? `\n\nNotes from attendee:\n${notes}` : ''}`,
+					start: {
+						dateTime: newStartDateTime.toISOString(),
+						timeZone: 'UTC'
+					},
+					end: {
+						dateTime: newEndDateTime.toISOString(),
+						timeZone: 'UTC'
+					},
+					attendees: [
+						{ email: originalBooking.attendee_email }
+					],
+					conferenceData: {
+						createRequest: {
+							requestId: crypto.randomUUID(),
+							conferenceSolutionKey: { type: 'hangoutsMeet' }
+						}
 					}
-				}
-			});
+				});
 
-			newCalendarEventId = calendarEvent.id;
-			newMeetingUrl = calendarEvent.hangoutLink || calendarEvent.htmlLink || null;
-		} catch (err) {
-			console.error('Error with Google Calendar:', err);
-			// Continue without calendar event if there's an error
+				newCalendarEventId = calendarEvent.id;
+				newMeetingUrl = calendarEvent.hangoutLink || calendarEvent.htmlLink || null;
+			} catch (err) {
+				console.error('Error with Google Calendar:', err);
+			}
+		}
+
+		// Cancel old Outlook Calendar event and create new one if Outlook was used
+		if (originalBooking.outlook_event_id && env.MICROSOFT_CLIENT_ID && env.MICROSOFT_CLIENT_SECRET) {
+			try {
+				const outlookToken = await getValidOutlookAccessToken(
+					db,
+					originalBooking.user_id,
+					env.MICROSOFT_CLIENT_ID,
+					env.MICROSOFT_CLIENT_SECRET
+				);
+
+				// Cancel old Outlook event if it exists
+				try {
+					await cancelOutlookCalendarEvent(outlookToken, originalBooking.outlook_event_id);
+				} catch (err) {
+					console.error('Error cancelling old Outlook Calendar event:', err);
+				}
+
+				// Create new Outlook event
+				const notes = originalBooking.attendee_notes;
+				const outlookEvent = await createOutlookCalendarEvent(outlookToken, {
+					summary: `${originalBooking.event_name} with ${originalBooking.attendee_name}`,
+					description: `${originalBooking.event_description || ''}\n\nAttendee: ${originalBooking.attendee_name} (${originalBooking.attendee_email})${notes ? `\n\nNotes from attendee:\n${notes}` : ''}`,
+					startTime: newStartDateTime.toISOString(),
+					endTime: newEndDateTime.toISOString(),
+					attendeeEmail: originalBooking.attendee_email,
+					hostEmail: originalBooking.host_email,
+					createTeamsMeeting: true
+				});
+
+				newOutlookEventId = outlookEvent.id;
+				if (outlookEvent.onlineMeeting?.joinUrl) {
+					newMeetingUrl = outlookEvent.onlineMeeting.joinUrl;
+				}
+			} catch (err) {
+				console.error('Error with Outlook Calendar:', err);
+			}
 		}
 
 		// Update the booking with new times (keeping attendee info) and set status to confirmed
@@ -159,6 +229,7 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 					start_time = ?,
 					end_time = ?,
 					google_event_id = ?,
+					outlook_event_id = ?,
 					meeting_url = ?,
 					status = 'confirmed'
 				WHERE id = ?`
@@ -167,6 +238,7 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 				newStartTime,
 				newEndTime,
 				newCalendarEventId,
+				newOutlookEventId,
 				newMeetingUrl,
 				bookingId
 			)
@@ -184,11 +256,9 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 			.bind(bookingId)
 			.run();
 
-		// Invalidate availability cache for both old and new dates
-		const oldDateStr = oldStartDateTime.toISOString().split('T')[0];
-		const newDateStr = newStartDateTime.toISOString().split('T')[0];
-		await env.KV.delete(`availability:${originalBooking.event_slug}:${oldDateStr}`);
-		await env.KV.delete(`availability:${originalBooking.event_slug}:${newDateStr}`);
+		// Invalidate availability cache for both old and new dates (daily and monthly)
+		await invalidateAvailabilityCache(env.KV, originalBooking.user_id, originalBooking.event_slug, originalBooking.start_time);
+		await invalidateAvailabilityCache(env.KV, originalBooking.user_id, originalBooking.event_slug, newStartTime);
 
 		// Send reschedule email (not cancellation email!)
 		if (env.EMAILIT_API_KEY) {
@@ -292,6 +362,27 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 				console.error('Failed to send reschedule email:', emailError);
 			}
 		}
+
+		// Dispatch booking.rescheduled webhook event
+		queueWebhookEvent(platform, db, originalBooking.user_id, 'booking.rescheduled', {
+			id: originalBooking.id,
+			event_type_id: originalBooking.event_type_id,
+			event_slug: originalBooking.event_slug,
+			user_id: originalBooking.user_id,
+			host_email: originalBooking.host_email,
+			start_time: newStartTime,
+			end_time: newEndTime,
+			old_start_time: originalBooking.start_time,
+			old_end_time: originalBooking.end_time,
+			attendee_name: originalBooking.attendee_name,
+			attendee_email: originalBooking.attendee_email,
+			attendee_phone: originalBooking.attendee_phone,
+			attendee_notes: originalBooking.attendee_notes,
+			external_ref: originalBooking.external_ref,
+			metadata: originalBooking.metadata,
+			meeting_url: newMeetingUrl,
+			status: 'rescheduled'
+		});
 
 		return json({
 			success: true,

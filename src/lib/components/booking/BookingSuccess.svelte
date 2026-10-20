@@ -6,6 +6,7 @@
 		meetingUrl: string | null;
 		meetingType?: 'google_meet' | 'teams';
 		brandColor: string;
+		locale?: 'es' | 'en';
 		formatTimeRange: (start: string, end: string) => string;
 		formatSelectedDate: (dateStr: string) => string;
 	}
@@ -17,41 +18,42 @@
 		meetingUrl,
 		meetingType = 'google_meet',
 		brandColor,
+		locale = 'es',
 		formatTimeRange,
 		formatSelectedDate
 	}: Props = $props();
 
-	const meetingLabel = meetingType === 'teams' ? 'Join Microsoft Teams Meeting' : 'Join Google Meet';
+	const meetingLabel = meetingType === 'teams' ? (locale === 'es' ? 'Unirse a Microsoft Teams' : 'Join Microsoft Teams') : (locale === 'es' ? 'Unirse a Google Meet' : 'Join Google Meet');
 </script>
 
-<div class="bg-white rounded-2xl shadow-lg p-6 sm:p-8 max-w-md w-full mx-2">
+<div class="bg-white rounded-2xl shadow-xl border border-slate-200/80 p-6 sm:p-8 max-w-md w-full mx-2">
 	<div class="text-center">
-		<div class="w-16 h-16 sm:w-20 sm:h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4 sm:mb-6">
-			<svg class="w-8 h-8 sm:w-10 sm:h-10 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+		<div class="w-16 h-16 sm:w-20 sm:h-20 bg-emerald-50 ring-8 ring-emerald-50/50 rounded-full flex items-center justify-center mx-auto mb-4 sm:mb-6">
+			<svg class="w-8 h-8 sm:w-10 sm:h-10 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path>
 			</svg>
 		</div>
-		<h1 class="text-xl sm:text-2xl font-semibold text-gray-900 mb-2">You are scheduled</h1>
-		<p class="text-gray-600 mb-6 sm:mb-8 text-sm sm:text-base">A calendar invitation has been sent to your email address.</p>
+		<h1 class="text-xl sm:text-2xl font-extrabold text-slate-900 mb-2">{locale === 'es' ? '¡Reunión Agendada!' : 'You are scheduled'}</h1>
+		<p class="text-slate-600 mb-6 sm:mb-8 text-sm">{locale === 'es' ? 'Hemos enviado la confirmación y el enlace de Google Meet a tu correo.' : 'A calendar invitation has been sent to your email address.'}</p>
 
-		<div class="bg-gray-50 rounded-lg p-4 sm:p-6 text-left mb-6">
-			<h3 class="font-semibold text-gray-900 mb-3 sm:mb-4">{eventName}</h3>
+		<div class="bg-slate-50 rounded-xl border border-slate-200/80 p-4 sm:p-5 text-left mb-6">
+			<h3 class="font-bold text-slate-900 mb-3">{eventName}</h3>
 			<div class="space-y-3 text-sm">
 				<div class="flex items-start gap-3">
-					<svg class="w-5 h-5 text-gray-400 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+					<svg class="w-5 h-5 text-emerald-600 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
 						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
 					</svg>
 					<div>
-						<p class="text-gray-900">{formatTimeRange(selectedSlot.start, selectedSlot.end)}</p>
-						<p class="text-gray-500">{formatSelectedDate(selectedDate)}</p>
+						<p class="font-bold text-slate-900">{formatTimeRange(selectedSlot.start, selectedSlot.end)}</p>
+						<p class="text-xs text-slate-500">{formatSelectedDate(selectedDate)}</p>
 					</div>
 				</div>
 				{#if meetingUrl}
-					<div class="flex items-start gap-3">
-						<svg class="w-5 h-5 text-gray-400 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+					<div class="flex items-start gap-3 pt-2 border-t border-slate-200/60">
+						<svg class="w-5 h-5 text-emerald-600 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
 							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
 						</svg>
-						<a href={meetingUrl} target="_blank" class="hover:underline break-all" style="color: {brandColor}">{meetingLabel}</a>
+						<a href={meetingUrl} target="_blank" rel="noopener noreferrer" class="font-bold text-emerald-600 hover:text-emerald-700 hover:underline break-all">{meetingLabel}</a>
 					</div>
 				{/if}
 			</div>

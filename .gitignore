@@ -1,12 +1,49 @@
+# Dependencies & Build
 node_modules/
 .svelte-kit/
 build/
+dist/
 .cloudflare/
+.wrangler/
+
+# Environment variables & secrets
 .env
 .env.*
 !.env.example
-.wrangler/
-dist/
+.dev.vars
+.dev.vars.*
+
+# Local docs & scratch
+secrets/
+private/
+artifacts/
+*.demo.toml
+
+# AI / Editor / Local Scratch & Archives
+.agent/
+.agents/
+.claude/
+.cursor/
+.vscode/
+.idea/
+*.zip
+*.tar.gz
+*.bak
+*.swp
+*.swo
+scratch/
+notes/
+todo.md
+TODO.md
+
+# Local SQLite / D1 Dumps
+*.db
+*.sqlite
+*.sqlite3
+dump.sql
+local-*.sql
+
+# OS & Logs
 .DS_Store
 *.log
 npm-debug.log*

@@ -38,6 +38,10 @@ export const GET: RequestHandler = async ({ url, platform }) => {
 	try {
 		const redirectUri = `${env.APP_URL}/auth/outlook/callback`;
 
+		if (!env.MICROSOFT_CLIENT_ID || !env.MICROSOFT_CLIENT_SECRET) {
+			throw redirect(302, '/dashboard?error=outlook_not_configured');
+		}
+
 		// Exchange code for tokens
 		const tokens = await exchangeOutlookCode(
 			code,

@@ -8,6 +8,8 @@ import { getCurrentUser } from '$lib/server/auth';
 import { cancelCalendarEvent, getValidAccessToken } from '$lib/server/google-calendar';
 import { cancelOutlookCalendarEvent, getValidOutlookAccessToken } from '$lib/server/outlook-calendar';
 import { sendCancellationEmail, getEmailTemplates, isEmailEnabled } from '$lib/server/email';
+import { invalidateAvailabilityCache } from '$lib/cache/kv-cache';
+import { queueWebhookEvent } from '$lib/server/webhooks';
 
 export const POST = async (event: RequestEvent) => {
 	const env = event.platform?.env;
@@ -37,8 +39,8 @@ export const POST = async (event: RequestEvent) => {
 		// Get booking and verify ownership
 		const booking = await db
 			.prepare(
-				`SELECT b.id, b.user_id, b.google_event_id, b.outlook_event_id, b.status, b.start_time, b.end_time,
-				b.attendee_name, b.attendee_email,
+				`SELECT b.id, b.user_id, b.event_type_id, b.google_event_id, b.outlook_event_id, b.status, b.start_time, b.end_time,
+				b.attendee_name, b.attendee_email, b.attendee_phone, b.attendee_notes, b.external_ref, b.metadata, b.meeting_url,
 				e.name as event_name, e.slug as event_slug, e.description as event_description,
 				u.name as host_name, u.email as host_email, u.contact_email, u.settings, u.brand_color
 				FROM bookings b
@@ -50,6 +52,7 @@ export const POST = async (event: RequestEvent) => {
 			.first<{
 				id: string;
 				user_id: string;
+				event_type_id: string;
 				google_event_id: string | null;
 				outlook_event_id: string | null;
 				status: string;
@@ -57,6 +60,11 @@ export const POST = async (event: RequestEvent) => {
 				end_time: string;
 				attendee_name: string;
 				attendee_email: string;
+				attendee_phone: string | null;
+				attendee_notes: string | null;
+				external_ref: string | null;
+				metadata: string | null;
+				meeting_url: string | null;
 				event_name: string;
 				event_slug: string;
 				event_description: string | null;
@@ -122,6 +130,30 @@ export const POST = async (event: RequestEvent) => {
 			.prepare(`UPDATE scheduled_emails SET status = 'cancelled' WHERE booking_id = ? AND status = 'pending'`)
 			.bind(bookingId)
 			.run();
+
+		// Invalidate availability cache (daily and monthly)
+		await invalidateAvailabilityCache(env.KV, booking.user_id, booking.event_slug, booking.start_time);
+
+		// Dispatch booking.canceled webhook event
+		queueWebhookEvent(event.platform, db, booking.user_id, 'booking.canceled', {
+			id: booking.id,
+			event_type_id: booking.event_type_id,
+			event_slug: booking.event_slug,
+			user_id: booking.user_id,
+			host_email: booking.host_email,
+			start_time: booking.start_time,
+			end_time: booking.end_time,
+			attendee_name: booking.attendee_name,
+			attendee_email: booking.attendee_email,
+			attendee_phone: booking.attendee_phone,
+			attendee_notes: booking.attendee_notes,
+			external_ref: booking.external_ref,
+			metadata: booking.metadata,
+			meeting_url: booking.meeting_url,
+			status: 'canceled',
+			canceled_by: 'host',
+			cancellation_reason: message || null
+		});
 
 		// Send cancellation email if enabled
 		if (env.EMAILIT_API_KEY) {

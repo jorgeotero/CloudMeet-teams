@@ -1,6 +1,9 @@
 name: Deploy to Cloudflare Pages
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -81,12 +84,14 @@ jobs:
           echo "Creating KV namespace..."
           npx wrangler kv namespace create cloudmeet-kv || true
 
-          # Get KV namespace ID from the list output
+          # Get KV namespace ID
           echo "Getting KV namespace ID..."
-          KV_LIST=$(npx wrangler kv namespace list)
-          echo "$KV_LIST"
-          # Extract ID for namespace titled "cloudmeet-kv"
-          KV_ID=$(echo "$KV_LIST" | grep -E '"title": "cloudmeet-kv"' -B1 | grep '"id"' | head -1 | sed 's/.*"id": "\([^"]*\)".*/\1/')
+          KV_ID=$(npx wrangler kv namespace list 2>/dev/null | jq -r '.[] | select(.title=="cloudmeet-kv" or .title=="cloudmeet-cloudmeet-kv") | .id' | head -1)
+          if [ -z "$KV_ID" ] || [ "$KV_ID" = "null" ]; then
+            KV_LIST=$(npx wrangler kv namespace list)
+            echo "$KV_LIST"
+            KV_ID=$(echo "$KV_LIST" | grep -E '"title": "cloudmeet-kv"' -B1 -A1 | grep '"id"' | head -1 | sed 's/.*"id": "\([^"]*\)".*/\1/')
+          fi
           echo "KV namespace ID: $KV_ID"
 
           if [ -n "$KV_ID" ] && [ "$KV_ID" != "null" ]; then

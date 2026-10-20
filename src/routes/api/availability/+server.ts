@@ -25,6 +25,8 @@ export const GET: RequestHandler = async ({ url, platform }) => {
 
 	const eventSlug = url.searchParams.get('event');
 	const date = url.searchParams.get('date'); // YYYY-MM-DD
+	const userIdParam = url.searchParams.get('userId');
+	const userSlugParam = url.searchParams.get('user') || url.searchParams.get('userSlug');
 
 	if (!eventSlug || !date) {
 		throw error(400, 'Missing required parameters');
@@ -33,23 +35,46 @@ export const GET: RequestHandler = async ({ url, platform }) => {
 	try {
 		const db = env.DB;
 
-		// Check cache first to avoid expensive DB/API calls
-		const cacheKey = `availability:${eventSlug}:${date}`;
-		const cached = await env.KV.get(cacheKey);
-		if (cached) {
-			return json(JSON.parse(cached));
+		// Resolve host user dynamically by userId or userSlug, falling back to first user
+		let user: { id: string; slug: string; timezone: string | null; settings: string | null } | null = null;
+		if (userIdParam) {
+			user = await db
+				.prepare('SELECT id, slug, timezone, settings FROM users WHERE id = ?')
+				.bind(userIdParam)
+				.first<{ id: string; slug: string; timezone: string | null; settings: string | null }>();
+		} else if (userSlugParam) {
+			user = await db
+				.prepare('SELECT id, slug, timezone, settings FROM users WHERE slug = ?')
+				.bind(userSlugParam)
+				.first<{ id: string; slug: string; timezone: string | null; settings: string | null }>();
+		} else {
+			user = await db
+				.prepare('SELECT id, slug, timezone, settings FROM users LIMIT 1')
+				.first<{ id: string; slug: string; timezone: string | null; settings: string | null }>();
 		}
-
-		// Get the first (and only) user for single-user setup
-		const user = await db
-			.prepare('SELECT id, slug, timezone, settings FROM users LIMIT 1')
-			.first<{ id: string; slug: string; timezone: string | null; settings: string | null }>();
 
 		if (!user) {
 			throw error(404, 'User not found');
 		}
 
-		const userTimezone = user.timezone || 'UTC';
+		// Check cache first to avoid expensive DB/API calls
+		const cacheKey = `availability:${user.id}:${eventSlug}:${date}`;
+		const cached = await env.KV.get(cacheKey);
+		if (cached) {
+			return json(JSON.parse(cached));
+		}
+
+		const userTimezone = (user.timezone && user.timezone !== 'UTC') ? user.timezone : 'America/Monterrey';
+
+		// Minimum notice: 1 day buffer (cannot book same-day or next-day meetings)
+		const todayFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: userTimezone, year: 'numeric', month: '2-digit', day: '2-digit' });
+		const tomorrowDate = new Date();
+		tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+		const tomorrowStr = todayFormatter.format(tomorrowDate);
+
+		if (date <= tomorrowStr) {
+			return json({ slots: [] });
+		}
 
 		// Parse user settings for global calendar defaults
 		let userSettings: { defaultAvailabilityCalendars?: string; selectedGoogleCalendars?: string[] } = {};
@@ -60,37 +85,127 @@ export const GET: RequestHandler = async ({ url, platform }) => {
 		}
 
 		const eventType = await db
-			.prepare('SELECT id, duration_minutes as duration, availability_calendars FROM event_types WHERE user_id = ? AND slug = ? AND is_active = 1')
+			.prepare('SELECT id, duration_minutes as duration, buffer_minutes, availability_calendars, meeting_room_id FROM event_types WHERE user_id = ? AND slug = ? AND is_active = 1')
 			.bind(user.id, eventSlug)
-			.first<{ id: string; duration: number; availability_calendars: string | null }>();
+			.first<{ id: string; duration: number; buffer_minutes: number | null; availability_calendars: string | null; meeting_room_id: string | null }>();
 
 		if (!eventType) {
 			throw error(404, 'Event type not found or inactive');
 		}
 
-		// Get calendar settings: use event type override if set, otherwise use global settings
-		const availabilityCalendars = eventType.availability_calendars || userSettings.defaultAvailabilityCalendars || 'both';
-		const useGoogleCalendar = availabilityCalendars === 'google' || availabilityCalendars === 'both';
-		const useOutlookCalendar = availabilityCalendars === 'outlook' || availabilityCalendars === 'both';
+		// Helper to create a Date in user's timezone
+		// Takes a date string (YYYY-MM-DD) and time string (HH:MM) in user's timezone
+		// and returns a UTC Date
+		function createDateInTimezone(dateStr: string, timeStr: string, timezone: string): Date {
+			const [hour, minute] = timeStr.split(':').map(Number);
+			const dateTimeStr = `${dateStr}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
+
+			const formatter = new Intl.DateTimeFormat('en-US', {
+				timeZone: timezone,
+				year: 'numeric',
+				month: '2-digit',
+				day: '2-digit',
+				hour: '2-digit',
+				minute: '2-digit',
+				second: '2-digit',
+				hour12: false
+			});
+
+			const targetDate = new Date(dateTimeStr + 'Z');
+			const parts = formatter.formatToParts(targetDate);
+			const tzHour = parseInt(parts.find(p => p.type === 'hour')?.value || '0');
+			const tzMinute = parseInt(parts.find(p => p.type === 'minute')?.value || '0');
+
+			const targetMinutes = hour * 60 + minute;
+			const actualMinutes = tzHour * 60 + tzMinute;
+			let offsetMinutes = actualMinutes - targetMinutes;
+
+			if (offsetMinutes > 12 * 60) offsetMinutes -= 24 * 60;
+			if (offsetMinutes < -12 * 60) offsetMinutes += 24 * 60;
+
+			return new Date(targetDate.getTime() - offsetMinutes * 60 * 1000);
+		}
+
+		// Check availability overrides for this date
+		const overrides = await db
+			.prepare(
+				`SELECT available, start_time, end_time
+				FROM availability_overrides
+				WHERE user_id = ? AND date = ?
+				ORDER BY start_time`
+			)
+			.bind(user.id, date)
+			.all<{ available: number | boolean; start_time: string | null; end_time: string | null }>();
+
+		const overrideList = overrides.results || [];
+
+		// If an override has available = 0 without start/end times, treat the whole date as unavailable
+		const isWholeDayBlocked = overrideList.some(
+			o => (!o.available || o.available === 0) && (!o.start_time || !o.end_time)
+		);
+		if (isWholeDayBlocked) {
+			await env.KV.put(cacheKey, JSON.stringify({ slots: [] }), { expirationTtl: 300 });
+			return json({ slots: [] });
+		}
 
 		// Parse date
 		const requestedDate = new Date(date);
 		const dayOfWeek = requestedDate.getDay();
 
-		// Get availability rules for this day
+		// Get availability rules for this day:
+		// Filter by is_active = 1 AND (event_type_id IS NULL OR event_type_id = ?)
 		const availabilityRules = await db
 			.prepare(
-				`SELECT start_time, end_time
+				`SELECT event_type_id, start_time, end_time
 				FROM availability_rules
-				WHERE user_id = ? AND day_of_week = ?
+				WHERE user_id = ? AND day_of_week = ? AND is_active = 1 AND (event_type_id IS NULL OR event_type_id = ?)
 				ORDER BY start_time`
 			)
-			.bind(user.id, dayOfWeek)
-			.all<{ start_time: string; end_time: string }>();
+			.bind(user.id, dayOfWeek, eventType.id)
+			.all<{ event_type_id: string | null; start_time: string; end_time: string }>();
 
-		if (!availabilityRules.results || availabilityRules.results.length === 0) {
+		// If event-specific rules exist for that event_type_id, prefer them over global (event_type_id IS NULL) rules
+		const eventSpecificRules = (availabilityRules.results || []).filter(r => r.event_type_id === eventType.id);
+		const dayRules = eventSpecificRules.length > 0
+			? eventSpecificRules
+			: (availabilityRules.results || []).filter(r => r.event_type_id === null);
+
+		// Determine effective working windows for this date:
+		// If custom available overrides exist (available = 1 with start & end times), prefer them over recurring weekly rules
+		const availableCustomOverrides = overrideList.filter(
+			o => (o.available === 1 || o.available === true) && o.start_time && o.end_time
+		);
+
+		let workingWindows: Array<{ start_time: string; end_time: string }> = [];
+		if (availableCustomOverrides.length > 0) {
+			workingWindows = availableCustomOverrides.map(o => ({
+				start_time: o.start_time!,
+				end_time: o.end_time!
+			}));
+		} else {
+			workingWindows = dayRules.map(r => ({
+				start_time: r.start_time,
+				end_time: r.end_time
+			}));
+		}
+
+		if (workingWindows.length === 0) {
+			await env.KV.put(cacheKey, JSON.stringify({ slots: [] }), { expirationTtl: 300 });
 			return json({ slots: [] });
 		}
+
+		// Blocked interval overrides on this date (available = 0 with start and end times)
+		const blockedOverrideSlots: TimeSlot[] = overrideList
+			.filter(o => (!o.available || o.available === 0) && o.start_time && o.end_time)
+			.map(o => ({
+				start: createDateInTimezone(date, o.start_time!, userTimezone).toISOString(),
+				end: createDateInTimezone(date, o.end_time!, userTimezone).toISOString()
+			}));
+
+		// Get calendar settings: use event type override if set, otherwise use global settings
+		const availabilityCalendars = eventType.availability_calendars || userSettings.defaultAvailabilityCalendars || 'both';
+		const useGoogleCalendar = availabilityCalendars === 'google' || availabilityCalendars === 'both';
+		const useOutlookCalendar = availabilityCalendars === 'outlook' || availabilityCalendars === 'both';
 
 		// Get busy times from connected calendars
 		const startOfDay = new Date(requestedDate);
@@ -147,7 +262,26 @@ export const GET: RequestHandler = async ({ url, platform }) => {
 			.bind(user.id, date)
 			.all<{ start_time: string; end_time: string }>();
 
-		// Combine busy slots from Google Calendar and bookings
+		// Query confirmed room bookings across the organization for this date to prevent room conflicts
+		let roomBusySlots: Array<{ start: string; end: string }> = [];
+		if (eventType.meeting_room_id) {
+			const roomBookings = await db
+				.prepare(
+					`SELECT start_time, end_time
+					FROM bookings
+					WHERE meeting_room_id = ? AND DATE(start_time) = ? AND status = 'confirmed'
+					ORDER BY start_time`
+				)
+				.bind(eventType.meeting_room_id, date)
+				.all<{ start_time: string; end_time: string }>();
+
+			roomBusySlots = (roomBookings.results || []).map(b => ({
+				start: b.start_time,
+				end: b.end_time
+			}));
+		}
+
+		// Combine busy slots from Google Calendar, Outlook Calendar, host bookings, room bookings, and blocked overrides
 		const allBusySlots = [
 			...busySlots.map(slot => ({
 				start: slot.start,
@@ -156,56 +290,17 @@ export const GET: RequestHandler = async ({ url, platform }) => {
 			...bookings.results.map(booking => ({
 				start: booking.start_time,
 				end: booking.end_time
-			}))
+			})),
+			...roomBusySlots,
+			...blockedOverrideSlots
 		];
 
 		// Generate available slots
 		const slots: TimeSlot[] = [];
+		const bufferMinutes = eventType.buffer_minutes || 0;
+		const bufferMs = bufferMinutes * 60 * 1000;
 
-		// Helper to create a Date in user's timezone
-		// Takes a date string (YYYY-MM-DD) and time string (HH:MM) in user's timezone
-		// and returns a UTC Date
-		function createDateInTimezone(dateStr: string, timeStr: string, timezone: string): Date {
-			const [hour, minute] = timeStr.split(':').map(Number);
-			// Create a date string that represents the time in the user's timezone
-			const dateTimeStr = `${dateStr}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
-
-			// Format the date in the target timezone to get the offset
-			const formatter = new Intl.DateTimeFormat('en-US', {
-				timeZone: timezone,
-				year: 'numeric',
-				month: '2-digit',
-				day: '2-digit',
-				hour: '2-digit',
-				minute: '2-digit',
-				second: '2-digit',
-				hour12: false
-			});
-
-			// Parse the target date/time and find the UTC equivalent
-			// We need to find what UTC time corresponds to this local time
-			const targetDate = new Date(dateTimeStr + 'Z'); // Start with UTC interpretation
-			const utcStr = targetDate.toISOString();
-
-			// Get what time it would be in the user's timezone if we used this UTC time
-			const parts = formatter.formatToParts(targetDate);
-			const tzHour = parseInt(parts.find(p => p.type === 'hour')?.value || '0');
-			const tzMinute = parseInt(parts.find(p => p.type === 'minute')?.value || '0');
-
-			// Calculate the offset in minutes
-			const targetMinutes = hour * 60 + minute;
-			const actualMinutes = tzHour * 60 + tzMinute;
-			let offsetMinutes = actualMinutes - targetMinutes;
-
-			// Handle day boundary crossing
-			if (offsetMinutes > 12 * 60) offsetMinutes -= 24 * 60;
-			if (offsetMinutes < -12 * 60) offsetMinutes += 24 * 60;
-
-			// Adjust to get the correct UTC time
-			return new Date(targetDate.getTime() - offsetMinutes * 60 * 1000);
-		}
-
-		for (const rule of availabilityRules.results) {
+		for (const rule of workingWindows) {
 			// Create start and end times in user's timezone, converted to UTC
 			let currentTime = createDateInTimezone(date, rule.start_time, userTimezone);
 			const endTime = createDateInTimezone(date, rule.end_time, userTimezone);
@@ -228,15 +323,11 @@ export const GET: RequestHandler = async ({ url, platform }) => {
 					continue;
 				}
 
-				// Check if slot conflicts with any busy time
+				// Check if slot conflicts with any busy time, respecting buffer_minutes
 				const hasConflict = allBusySlots.some(busy => {
-					const busyStart = new Date(busy.start);
-					const busyEnd = new Date(busy.end);
-					return (
-						(currentTime >= busyStart && currentTime < busyEnd) ||
-						(slotEnd > busyStart && slotEnd <= busyEnd) ||
-						(currentTime <= busyStart && slotEnd >= busyEnd)
-					);
+					const busyStart = new Date(new Date(busy.start).getTime() - bufferMs);
+					const busyEnd = new Date(new Date(busy.end).getTime() + bufferMs);
+					return currentTime < busyEnd && slotEnd > busyStart;
 				});
 
 				if (!hasConflict) {

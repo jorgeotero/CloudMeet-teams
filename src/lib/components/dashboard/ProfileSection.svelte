@@ -4,7 +4,7 @@
 			name?: string;
 			email?: string;
 			profile_image?: string | null;
-			brand_color?: string;
+			brand_color?: string | null;
 			contact_email?: string | null;
 			settings?: string | null;
 		} | null;

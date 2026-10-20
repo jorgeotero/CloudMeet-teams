@@ -8,6 +8,7 @@
 		brandColor: string;
 		brandLighter: string;
 		brandDark: string;
+		locale?: 'es' | 'en';
 		onDateSelect: (dateStr: string) => void;
 		onPrevMonth: () => void;
 		onNextMonth: () => void;
@@ -20,12 +21,17 @@
 		brandColor,
 		brandLighter,
 		brandDark,
+		locale = 'es',
 		onDateSelect,
 		onPrevMonth,
 		onNextMonth
 	}: Props = $props();
 
-	const weekDays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+	const weekDays = $derived(
+		locale === 'es'
+			? ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom']
+			: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+	);
 
 	const calendarDays = $derived(() => {
 		const year = currentMonth.getFullYear();
@@ -47,10 +53,14 @@
 
 		const today = new Date();
 		today.setHours(0, 0, 0, 0);
+		// 1 day buffer: minimum notice means cannot book today or tomorrow
+		const minNoticeDate = new Date(today);
+		minNoticeDate.setDate(minNoticeDate.getDate() + 2);
+
 		for (let i = 1; i <= lastDay.getDate(); i++) {
 			const date = new Date(year, month, i);
 			const dateStr = formatDateLocal(date);
-			const isAvailable = date >= today && date <= new Date(today.getTime() + 60 * 24 * 60 * 60 * 1000);
+			const isAvailable = date >= minNoticeDate && date <= new Date(today.getTime() + 60 * 24 * 60 * 60 * 1000);
 			days.push({
 				date,
 				isCurrentMonth: true,
@@ -74,7 +84,7 @@
 	});
 
 	function formatMonthYear(date: Date) {
-		return new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric' }).format(date);
+		return new Intl.DateTimeFormat(locale === 'es' ? 'es-MX' : 'en-US', { month: 'long', year: 'numeric' }).format(date);
 	}
 </script>
 

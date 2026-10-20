@@ -7,7 +7,7 @@
 import { error } from '@sveltejs/kit';
 import type { PageServerLoad } from './$types';
 
-export const load: PageServerLoad = async ({ params, platform }) => {
+export const load: PageServerLoad = async ({ params, platform, url }) => {
 	const env = platform?.env;
 	if (!env) {
 		throw error(500, 'Platform env not available');
@@ -29,7 +29,12 @@ export const load: PageServerLoad = async ({ params, platform }) => {
 		// Get event type
 		const eventType = await db
 			.prepare(
-				'SELECT id, name, slug, duration_minutes as duration, description, is_active, cover_image, invite_calendar FROM event_types WHERE user_id = ? AND slug = ? AND is_active = 1'
+				`SELECT e.id, e.name, e.slug, e.duration_minutes as duration, e.description, e.is_active,
+					e.cover_image, e.invite_calendar, e.location_type, e.meeting_room_id,
+					r.name as room_name, r.location as room_location
+				FROM event_types e
+				LEFT JOIN meeting_rooms r ON e.meeting_room_id = r.id
+				WHERE e.user_id = ? AND e.slug = ? AND e.is_active = 1`
 			)
 			.bind(user.id, slug)
 			.first<{
@@ -41,6 +46,10 @@ export const load: PageServerLoad = async ({ params, platform }) => {
 				is_active: number;
 				cover_image: string | null;
 				invite_calendar: string | null;
+				location_type: string | null;
+				meeting_room_id: string | null;
+				room_name: string | null;
+				room_location: string | null;
 			}>();
 
 		if (!eventType) {
@@ -62,6 +71,23 @@ export const load: PageServerLoad = async ({ params, platform }) => {
 			effectiveInviteCalendar = 'google';
 		}
 
+		// Extract query params for prefilling and embed mode
+		const name = url.searchParams.get('name') || url.searchParams.get('attendeeName') || '';
+		const email = url.searchParams.get('email') || url.searchParams.get('attendeeEmail') || '';
+		const phone = url.searchParams.get('phone') || url.searchParams.get('attendeePhone') || '';
+		const notes = url.searchParams.get('notes') || '';
+		const lockPrefill = ['1', 'true', 'yes'].includes((url.searchParams.get('lock_prefill') || '').toLowerCase());
+		const externalRef = url.searchParams.get('ref') || url.searchParams.get('external_ref') || '';
+		const isEmbed = ['1', 'true', 'yes'].includes((url.searchParams.get('embed') || '').toLowerCase());
+
+		// Extract UTM and metadata parameters
+		const metadata: Record<string, string> = {};
+		for (const [key, value] of url.searchParams.entries()) {
+			if (key.startsWith('utm_') || key.startsWith('meta_')) {
+				metadata[key] = value;
+			}
+		}
+
 		return {
 			slug: eventType.slug,
 			eventType: {
@@ -69,10 +95,22 @@ export const load: PageServerLoad = async ({ params, platform }) => {
 				invite_calendar: effectiveInviteCalendar
 			},
 			user: {
+				id: user.id,
+				slug: user.slug,
 				name: user.name,
 				profileImage: user.profile_image,
 				brandColor: user.brand_color || '#3b82f6',
 				timeFormat: userSettings.timeFormat || '12h'
+			},
+			prefill: {
+				name,
+				email,
+				phone,
+				notes,
+				lockPrefill,
+				externalRef,
+				metadata,
+				isEmbed
 			}
 		};
 	} catch (err: any) {

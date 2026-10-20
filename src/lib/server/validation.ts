@@ -13,7 +13,9 @@ export const MAX_LENGTHS = {
 	email: 254, // RFC 5321 maximum
 	description: 5000,
 	notes: 1000,
-	slug: 50
+	slug: 50,
+	phone: 50,
+	externalRef: 255
 } as const;
 
 /**

@@ -50,55 +50,237 @@ export const GET: RequestHandler = async ({ url, platform, cookies }) => {
 
 		// Get user info
 		const userInfo = await getGoogleUserInfo(tokens.access_token);
-
-		// Restrict login to admin email only
-		if (adminEmail && userInfo.email !== adminEmail) {
-			throw error(403, 'Access denied. Only the admin can log in.');
-		}
-
-		// Check if user exists in database, or create them
+		const userEmail = userInfo.email.toLowerCase().trim();
 		const db = env.DB;
 
-		// Check if user exists by email
-		let user = await db.prepare('SELECT id FROM users WHERE email = ?').bind(userInfo.email).first<{ id: string }>();
+		const isAdmin = adminEmail ? userEmail === adminEmail.toLowerCase().trim() : true;
 
+		// If not admin, check if user is invited or already an active member of an organization
+		let pendingInvitations: Array<{ id: string; organization_id: string; role: 'owner' | 'admin' | 'member' }> = [];
+		if (!isAdmin) {
+			// Check for pending active invitations
+			const invQuery = await db
+				.prepare(
+					`SELECT id, organization_id, role
+					FROM organization_invitations
+					WHERE LOWER(email) = LOWER(?) AND expires_at > datetime('now')`
+				)
+				.bind(userEmail)
+				.all<{ id: string; organization_id: string; role: 'owner' | 'admin' | 'member' }>();
+
+			pendingInvitations = invQuery.results || [];
+
+			// Check for existing active membership
+			const existingMember = await db
+				.prepare(
+					`SELECT m.id, m.organization_id, m.role
+					FROM organization_members m
+					JOIN users u ON m.user_id = u.id
+					WHERE LOWER(u.email) = LOWER(?)`
+				)
+				.bind(userEmail)
+				.first<{ id: string; organization_id: string; role: string }>();
+
+			if (pendingInvitations.length === 0 && !existingMember) {
+				throw error(403, 'Access denied. You must be invited by an organization administrator.');
+			}
+		}
+
+		// Check if user exists by email
+		let user = await db
+			.prepare('SELECT id, slug FROM users WHERE LOWER(email) = LOWER(?)')
+			.bind(userEmail)
+			.first<{ id: string; slug: string }>();
+
+		let userId: string;
 		if (!user) {
-			// Create the admin user
-			const userId = crypto.randomUUID();
-			const slug = userInfo.email.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '');
+			userId = crypto.randomUUID();
+			const baseSlug = userEmail.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '') || 'user';
+			
+			// Ensure unique user slug
+			let slug = baseSlug;
+			let counter = 1;
+			while (true) {
+				const existing = await db.prepare('SELECT id FROM users WHERE slug = ?').bind(slug).first();
+				if (!existing) break;
+				slug = `${baseSlug}-${counter++}`;
+			}
 
 			await db
 				.prepare(
-					`INSERT INTO users (id, email, name, slug, google_refresh_token, created_at)
-					VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+					`INSERT INTO users (id, email, name, slug, google_refresh_token, profile_image, created_at)
+					VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
 				)
 				.bind(
 					userId,
-					userInfo.email,
+					userEmail,
 					userInfo.name,
 					slug,
-					tokens.refresh_token || null
+					tokens.refresh_token || null,
+					userInfo.picture || null
 				)
 				.run();
 
-			user = { id: userId };
+			user = { id: userId, slug };
 		} else {
-			// Update existing user's tokens
+			userId = user.id;
+			// Update existing user's tokens & profile
 			await db
 				.prepare(
 					`UPDATE users
 					SET google_refresh_token = COALESCE(?, google_refresh_token),
 						email = ?,
-						name = ?
+						name = ?,
+						profile_image = COALESCE(?, profile_image)
 					WHERE id = ?`
 				)
 				.bind(
 					tokens.refresh_token || null,
-					userInfo.email,
+					userEmail,
 					userInfo.name,
-					user.id
+					userInfo.picture || null,
+					userId
 				)
 				.run();
+		}
+
+		// Ensure Organization setup:
+		if (isAdmin) {
+			// Ensure a default organization exists for this super-owner
+			const existingOwnerOrg = await db
+				.prepare(
+					`SELECT o.id, o.slug
+					FROM organizations o
+					JOIN organization_members m ON o.id = m.organization_id
+					WHERE m.user_id = ? AND m.role = 'owner'`
+				)
+				.bind(userId)
+				.first<{ id: string; slug: string }>();
+
+			if (!existingOwnerOrg) {
+				const orgId = crypto.randomUUID();
+				const orgName = `${userInfo.name}'s Workspace`;
+				let orgSlug = user.slug || 'workspace';
+				let counter = 1;
+				while (true) {
+					const existing = await db.prepare('SELECT id FROM organizations WHERE slug = ?').bind(orgSlug).first();
+					if (!existing) break;
+					orgSlug = `${user.slug}-org-${counter++}`;
+				}
+
+				await db
+					.prepare('INSERT INTO organizations (id, name, slug) VALUES (?, ?, ?)')
+					.bind(orgId, orgName, orgSlug)
+					.run();
+
+				await db
+					.prepare('INSERT INTO organization_members (id, organization_id, user_id, role) VALUES (?, ?, ?, ?)')
+					.bind(crypto.randomUUID(), orgId, userId, 'owner')
+					.run();
+
+				// Associate existing unassociated event_types and bookings
+				await db
+					.prepare('UPDATE event_types SET organization_id = ? WHERE user_id = ? AND organization_id IS NULL')
+					.bind(orgId, userId)
+					.run();
+
+				await db
+					.prepare('UPDATE bookings SET organization_id = ? WHERE user_id = ? AND organization_id IS NULL')
+					.bind(orgId, userId)
+					.run();
+			}
+		}
+
+		// Process any pending invitations for this user
+		if (pendingInvitations.length > 0) {
+			for (const invitation of pendingInvitations) {
+				// Upsert membership
+				await db
+					.prepare(
+						`INSERT INTO organization_members (id, organization_id, user_id, role)
+						VALUES (?, ?, ?, ?)
+						ON CONFLICT(organization_id, user_id) DO UPDATE SET role = excluded.role`
+					)
+					.bind(crypto.randomUUID(), invitation.organization_id, userId, invitation.role)
+					.run();
+
+				// Delete accepted invitation
+				await db
+					.prepare('DELETE FROM organization_invitations WHERE id = ?')
+					.bind(invitation.id)
+					.run();
+			}
+		}
+
+		// Ensure Multi-Tenant Organization Slug & Default 'Reunión Virtual' Event Type
+		const memberOrgs = await db
+			.prepare(
+				`SELECT o.id, o.slug
+				FROM organizations o
+				JOIN organization_members m ON o.id = m.organization_id
+				WHERE m.user_id = ?
+				ORDER BY CASE m.role WHEN 'owner' THEN 1 WHEN 'admin' THEN 2 ELSE 3 END LIMIT 1`
+			)
+			.bind(userId)
+			.first<{ id: string; slug: string }>();
+
+		if (memberOrgs) {
+			const orgSlug = memberOrgs.slug;
+			const cleanNameSlug = (userInfo.name || userEmail.split('@')[0])
+				.toLowerCase()
+				.normalize('NFD')
+				.replace(/[\u0300-\u036f]/g, '')
+				.replace(/[^a-z0-9]/g, '');
+			const targetSlug = `${orgSlug}-${cleanNameSlug}`;
+
+			// Update slug to include organization if not already scoped
+			if (!user.slug.startsWith(`${orgSlug}-`)) {
+				await db
+					.prepare('UPDATE users SET slug = ? WHERE id = ?')
+					.bind(targetSlug, userId)
+					.run();
+				user.slug = targetSlug;
+			}
+
+			// Ensure default 30-min 'Reunión Virtual' event type exists for this organization & user
+			const existingEventType = await db
+				.prepare('SELECT id FROM event_types WHERE user_id = ? AND slug = ?')
+				.bind(userId, 'reunion-virtual')
+				.first<{ id: string }>();
+
+			if (!existingEventType) {
+				const eventTypeId = crypto.randomUUID();
+				await db
+					.prepare(
+						`INSERT INTO event_types (
+							id, user_id, organization_id, name, slug, duration_minutes,
+							description, location_type, is_active
+						) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					)
+					.bind(
+						eventTypeId,
+						userId,
+						memberOrgs.id,
+						'Reunión Virtual',
+						'reunion-virtual',
+						30,
+						'Reunión comercial virtual para presentación de cotización y dudas.',
+						'google_meet',
+						1
+					)
+					.run();
+
+				// Ensure weekly recurring availability (Monday to Friday, 09:00 - 18:00)
+				for (let day = 1; day <= 5; day++) {
+					await db
+						.prepare(
+							`INSERT INTO availability_rules (id, user_id, event_type_id, day_of_week, start_time, end_time, is_active)
+							VALUES (?, ?, ?, ?, ?, ?, ?)`
+						)
+						.bind(crypto.randomUUID(), userId, eventTypeId, day, '09:00', '18:00', 1)
+						.run();
+				}
+			}
 		}
 
 		// Create session token (note: user.id is now a string UUID)

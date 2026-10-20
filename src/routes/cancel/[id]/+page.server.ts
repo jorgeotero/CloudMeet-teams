@@ -5,7 +5,10 @@
 import { error, redirect, fail } from '@sveltejs/kit';
 import type { PageServerLoad, Actions } from './$types';
 import { cancelCalendarEvent, getValidAccessToken } from '$lib/server/google-calendar';
+import { cancelOutlookCalendarEvent, getValidOutlookAccessToken } from '$lib/server/outlook-calendar';
 import { sendCancellationEmail, sendAdminCancellationNotification, getEmailTemplates, isEmailEnabled } from '$lib/server/email';
+import { invalidateAvailabilityCache } from '$lib/cache/kv-cache';
+import { queueWebhookEvent } from '$lib/server/webhooks';
 
 export const load: PageServerLoad = async ({ params, platform }) => {
 	const db = platform?.env?.DB;
@@ -74,8 +77,11 @@ export const actions: Actions = {
 			// Get booking and user details
 			const booking = await db
 				.prepare(
-					`SELECT b.id, b.user_id, b.google_event_id, b.status
+					`SELECT b.id, b.user_id, b.google_event_id, b.outlook_event_id, b.status, b.start_time,
+					e.slug as event_slug, u.outlook_refresh_token
 					FROM bookings b
+					JOIN event_types e ON b.event_type_id = e.id
+					JOIN users u ON b.user_id = u.id
 					WHERE b.id = ?`
 				)
 				.bind(bookingId)
@@ -83,7 +89,11 @@ export const actions: Actions = {
 					id: string;
 					user_id: string;
 					google_event_id: string | null;
+					outlook_event_id: string | null;
 					status: string;
+					start_time: string;
+					event_slug: string;
+					outlook_refresh_token: string | null;
 				}>();
 
 			if (!booking) {
@@ -110,6 +120,22 @@ export const actions: Actions = {
 				}
 			}
 
+			// Cancel in Outlook Calendar if event exists and host has refresh token
+			if (booking.outlook_event_id && booking.outlook_refresh_token && env.MICROSOFT_CLIENT_ID && env.MICROSOFT_CLIENT_SECRET) {
+				try {
+					const outlookToken = await getValidOutlookAccessToken(
+						db,
+						booking.user_id,
+						env.MICROSOFT_CLIENT_ID,
+						env.MICROSOFT_CLIENT_SECRET
+					);
+					await cancelOutlookCalendarEvent(outlookToken, booking.outlook_event_id);
+				} catch (err) {
+					console.error('Failed to cancel Outlook Calendar event:', err);
+					// Continue with database cancellation even if Outlook Calendar fails
+				}
+			}
+
 			// Update booking status and cancel scheduled reminders
 			await db
 				.prepare('UPDATE bookings SET status = ?, canceled_at = CURRENT_TIMESTAMP, canceled_by = ?, cancellation_reason = ? WHERE id = ?')
@@ -122,39 +148,72 @@ export const actions: Actions = {
 				.bind(bookingId)
 				.run();
 
-			// Send cancellation email if enabled
-			if (env.EMAILIT_API_KEY) {
-				try {
-					// Get full booking details for email
-					const fullBooking = await db
-						.prepare(
-							`SELECT b.id, b.start_time, b.end_time, b.attendee_name, b.attendee_email,
-							e.name as event_name, e.slug as event_slug, e.description as event_description,
-							u.id as user_id, u.name as host_name, u.email as host_email, u.contact_email, u.settings, u.brand_color
-							FROM bookings b
-							JOIN event_types e ON b.event_type_id = e.id
-							JOIN users u ON b.user_id = u.id
-							WHERE b.id = ?`
-						)
-						.bind(bookingId)
-						.first<{
-							id: string;
-							start_time: string;
-							end_time: string;
-							attendee_name: string;
-							attendee_email: string;
-							event_name: string;
-							event_slug: string;
-							event_description: string | null;
-							user_id: string;
-							host_name: string;
-							host_email: string;
-							contact_email: string | null;
-							settings: string | null;
-							brand_color: string | null;
-						}>();
+			// Invalidate availability cache (daily and monthly)
+			await invalidateAvailabilityCache(env.KV, booking.user_id, booking.event_slug, booking.start_time);
 
-					if (fullBooking) {
+			// Get full booking details for webhook and email
+			const fullBooking = await db
+				.prepare(
+					`SELECT b.id, b.user_id, b.event_type_id, b.start_time, b.end_time,
+					b.attendee_name, b.attendee_email, b.attendee_phone, b.attendee_notes,
+					b.external_ref, b.metadata, b.meeting_url,
+					e.name as event_name, e.slug as event_slug, e.description as event_description,
+					u.name as host_name, u.email as host_email, u.contact_email, u.settings, u.brand_color
+					FROM bookings b
+					JOIN event_types e ON b.event_type_id = e.id
+					JOIN users u ON b.user_id = u.id
+					WHERE b.id = ?`
+				)
+				.bind(bookingId)
+				.first<{
+					id: string;
+					user_id: string;
+					event_type_id: string;
+					start_time: string;
+					end_time: string;
+					attendee_name: string;
+					attendee_email: string;
+					attendee_phone: string | null;
+					attendee_notes: string | null;
+					external_ref: string | null;
+					metadata: string | null;
+					meeting_url: string | null;
+					event_name: string;
+					event_slug: string;
+					event_description: string | null;
+					host_name: string;
+					host_email: string;
+					contact_email: string | null;
+					settings: string | null;
+					brand_color: string | null;
+				}>();
+
+			if (fullBooking) {
+				// Dispatch booking.canceled webhook event
+				queueWebhookEvent(platform, db, fullBooking.user_id, 'booking.canceled', {
+					id: fullBooking.id,
+					event_type_id: fullBooking.event_type_id,
+					event_slug: fullBooking.event_slug,
+					user_id: fullBooking.user_id,
+					host_email: fullBooking.host_email,
+					start_time: fullBooking.start_time,
+					end_time: fullBooking.end_time,
+					attendee_name: fullBooking.attendee_name,
+					attendee_email: fullBooking.attendee_email,
+					attendee_phone: fullBooking.attendee_phone,
+					attendee_notes: fullBooking.attendee_notes,
+					external_ref: fullBooking.external_ref,
+					metadata: fullBooking.metadata,
+					meeting_url: fullBooking.meeting_url,
+					status: 'canceled',
+					canceled_by: 'attendee',
+					cancellation_reason: reason
+				});
+			}
+
+			// Send cancellation email if enabled
+			if (env.EMAILIT_API_KEY && fullBooking) {
+				try {
 						// Parse user settings for time format
 						let timeFormat: '12h' | '24h' = '12h';
 						try {
@@ -225,7 +284,6 @@ export const actions: Actions = {
 						} catch (adminErr) {
 							console.error('Failed to send admin cancellation notification:', adminErr);
 						}
-					}
 				} catch (emailErr) {
 					console.error('Failed to send cancellation email:', emailErr);
 				}

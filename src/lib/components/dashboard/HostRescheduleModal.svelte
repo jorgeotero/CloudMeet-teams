@@ -96,7 +96,7 @@
 			// Fetch available slots for this date
 			const response = await fetch(`/api/availability?date=${dateKey}&event=${booking?.event_type_slug}`);
 			if (response.ok) {
-				const data = await response.json();
+				const data = (await response.json()) as { slots?: Array<{ start: string; end: string }> };
 				availableSlots = data.slots || [];
 			} else {
 				error = 'Failed to load available times';

@@ -9,6 +9,8 @@ import { createCalendarEvent, getValidAccessToken } from '$lib/server/google-cal
 import { createOutlookCalendarEvent, getValidOutlookAccessToken } from '$lib/server/outlook-calendar';
 import { sendBookingEmail, sendAdminNotificationEmail, getEmailTemplates, isEmailEnabled, type EmailTemplateType } from '$lib/server/email';
 import { isValidEmail, validateLength, validateFields, MAX_LENGTHS } from '$lib/server/validation';
+import { invalidateAvailabilityCache } from '$lib/cache/kv-cache';
+import { queueWebhookEvent } from '$lib/server/webhooks';
 
 export const POST: RequestHandler = async ({ request, platform }) => {
 	const env = platform?.env;
@@ -23,11 +25,18 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 			endTime: string;
 			attendeeName: string;
 			attendeeEmail: string;
+			attendeePhone?: string;
 			notes?: string;
 			turnstileToken?: string;
 			timezone?: string;
+			externalRef?: string;
+			metadata?: Record<string, any> | string;
+			userId?: string;
+			userSlug?: string;
+			orgSlug?: string;
+			organizationId?: string;
 		};
-		const { eventSlug, startTime, endTime, attendeeName, attendeeEmail, notes, turnstileToken, timezone } = body;
+		const { eventSlug, startTime, endTime, attendeeName, attendeeEmail, attendeePhone, notes, turnstileToken, timezone, externalRef, metadata, userId: reqUserId, userSlug: reqUserSlug, orgSlug: reqOrgSlug, organizationId: reqOrgId } = body;
 
 		// Validate required fields
 		if (!eventSlug || !startTime || !endTime || !attendeeName || !attendeeEmail) {
@@ -38,7 +47,9 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 		const lengthError = validateFields([
 			validateLength(attendeeName, 'Name', MAX_LENGTHS.name, true),
 			validateLength(attendeeEmail, 'Email', MAX_LENGTHS.email, true),
-			validateLength(notes, 'Notes', MAX_LENGTHS.notes, false)
+			validateLength(attendeePhone, 'Phone', MAX_LENGTHS.phone, false),
+			validateLength(notes, 'Notes', MAX_LENGTHS.notes, false),
+			validateLength(externalRef, 'External Reference', MAX_LENGTHS.externalRef, false)
 		]);
 		if (lengthError) {
 			throw error(400, lengthError);
@@ -73,22 +84,48 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 
 		const db = env.DB;
 
-		// Get the first (and only) user for single-user setup
-		const user = await db
-			.prepare('SELECT id, email, name, slug, contact_email, settings, brand_color, outlook_refresh_token FROM users LIMIT 1')
-			.first<{ id: string; email: string; name: string; slug: string; contact_email: string | null; settings: string | null; brand_color: string | null; outlook_refresh_token: string | null }>();
+		// Resolve host user dynamically by userId or userSlug, falling back to first user
+		let user: { id: string; email: string; name: string; slug: string; contact_email: string | null; settings: string | null; brand_color: string | null; outlook_refresh_token: string | null } | null = null;
+		if (reqUserId) {
+			user = await db
+				.prepare('SELECT id, email, name, slug, contact_email, settings, brand_color, outlook_refresh_token FROM users WHERE id = ?')
+				.bind(reqUserId)
+				.first();
+		} else if (reqUserSlug) {
+			user = await db
+				.prepare('SELECT id, email, name, slug, contact_email, settings, brand_color, outlook_refresh_token FROM users WHERE slug = ?')
+				.bind(reqUserSlug)
+				.first();
+		} else {
+			user = await db
+				.prepare('SELECT id, email, name, slug, contact_email, settings, brand_color, outlook_refresh_token FROM users LIMIT 1')
+				.first();
+		}
 
 		if (!user) {
 			throw error(404, 'User not found');
 		}
 
+		// Resolve organization_id if provided via orgSlug or organizationId
+		let resolvedOrgId: string | null = reqOrgId || null;
+		if (!resolvedOrgId && reqOrgSlug) {
+			const org = await db.prepare('SELECT id FROM organizations WHERE slug = ?').bind(reqOrgSlug).first<{ id: string }>();
+			if (org) {
+				resolvedOrgId = org.id;
+			}
+		}
+
 		const eventType = await db
-			.prepare('SELECT id, name, duration_minutes as duration, description, invite_calendar FROM event_types WHERE user_id = ? AND slug = ? AND is_active = 1')
+			.prepare('SELECT id, organization_id, name, duration_minutes as duration, buffer_minutes, description, invite_calendar, meeting_room_id FROM event_types WHERE user_id = ? AND slug = ? AND is_active = 1')
 			.bind(user.id, eventSlug)
-			.first<{ id: string; name: string; duration: number; description: string; invite_calendar: string | null }>();
+			.first<{ id: string; organization_id: string | null; name: string; duration: number; buffer_minutes: number | null; description: string; invite_calendar: string | null; meeting_room_id: string | null }>();
 
 		if (!eventType) {
 			throw error(404, 'Event type not found or inactive');
+		}
+
+		if (!resolvedOrgId && eventType.organization_id) {
+			resolvedOrgId = eventType.organization_id;
 		}
 
 		// Parse user settings for global calendar defaults
@@ -112,22 +149,40 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 		const startDateTime = new Date(startTime);
 		const endDateTime = new Date(endTime);
 
-		// Check for conflicts with existing bookings
+		// Check for conflicts with existing bookings, respecting buffer_minutes
+		const bufferMinutes = eventType.buffer_minutes || 0;
+		const bufferMs = bufferMinutes * 60 * 1000;
+		const bufferedStartTime = new Date(startDateTime.getTime() - bufferMs).toISOString();
+		const bufferedEndTime = new Date(endDateTime.getTime() + bufferMs).toISOString();
+
+		// Host conflict check
 		const conflict = await db
 			.prepare(
 				`SELECT id FROM bookings
 				WHERE user_id = ? AND status = 'confirmed'
-				AND (
-					(start_time <= ? AND end_time > ?)
-					OR (start_time < ? AND end_time >= ?)
-					OR (start_time >= ? AND end_time <= ?)
-				)`
+				AND start_time < ? AND end_time > ?`
 			)
-			.bind(user.id, startTime, startTime, endTime, endTime, startTime, endTime)
+			.bind(user.id, bufferedEndTime, bufferedStartTime)
 			.first();
 
 		if (conflict) {
 			throw error(409, 'This time slot is no longer available');
+		}
+
+		// Meeting room conflict check (if a physical meeting room is assigned to this event type)
+		if (eventType.meeting_room_id) {
+			const roomConflict = await db
+				.prepare(
+					`SELECT id FROM bookings
+					WHERE meeting_room_id = ? AND status = 'confirmed'
+					AND start_time < ? AND end_time > ?`
+				)
+				.bind(eventType.meeting_room_id, bufferedEndTime, bufferedStartTime)
+				.first();
+
+			if (roomConflict) {
+				throw error(409, 'The meeting room is no longer available for this time slot');
+			}
 		}
 
 		// Create calendar event in the selected calendar only (one calendar sends the invite)
@@ -204,32 +259,64 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 		}
 
 		// Create booking in database
-		const result = await db
+		const metadataStr = typeof metadata === 'object' && metadata !== null
+			? JSON.stringify(metadata)
+			: (typeof metadata === 'string' ? metadata : null);
+
+		const bookingId = crypto.randomUUID();
+
+		await db
 			.prepare(
 				`INSERT INTO bookings (
-					user_id, event_type_id, start_time, end_time,
-					attendee_name, attendee_email, attendee_notes, status,
+					id, user_id, organization_id, meeting_room_id, event_type_id, start_time, end_time,
+					attendee_name, attendee_email, attendee_phone, attendee_notes,
+					external_ref, metadata, status,
 					google_event_id, outlook_event_id, meeting_url, created_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, CURRENT_TIMESTAMP)`
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, CURRENT_TIMESTAMP)`
 			)
 			.bind(
+				bookingId,
 				user.id,
+				resolvedOrgId,
+				eventType.meeting_room_id || null,
 				eventType.id,
 				startTime,
 				endTime,
 				attendeeName,
 				attendeeEmail,
+				attendeePhone || null,
 				notes || null,
+				externalRef || null,
+				metadataStr,
 				googleEventId,
 				outlookEventId,
 				meetingUrl
 			)
 			.run();
 
-		// Invalidate availability cache
-		const dateStr = startDateTime.toISOString().split('T')[0];
-		const cacheKey = `availability:${eventSlug}:${dateStr}`;
-		await env.KV.delete(cacheKey);
+		// Invalidate availability cache (daily and monthly)
+		await invalidateAvailabilityCache(env.KV, user.id, eventSlug, startTime);
+
+		// Trigger webhook event
+		queueWebhookEvent(platform, db, user.id, 'booking.created', {
+			id: bookingId,
+			event_type_id: eventType.id,
+			meeting_room_id: eventType.meeting_room_id || null,
+			organization_id: resolvedOrgId,
+			event_slug: eventSlug,
+			user_id: user.id,
+			host_email: user.email,
+			start_time: startTime,
+			end_time: endTime,
+			attendee_name: attendeeName,
+			attendee_email: attendeeEmail,
+			attendee_phone: attendeePhone || null,
+			attendee_notes: notes || null,
+			external_ref: externalRef || null,
+			metadata: metadata || null,
+			meeting_url: meetingUrl,
+			status: 'confirmed'
+		});
 
 		// Send booking confirmation email via Emailit (if enabled)
 		if (env.EMAILIT_API_KEY) {
@@ -245,13 +332,6 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 
 				// Use contact email for reply-to if available
 				const replyToEmail = user.contact_email || user.email;
-
-				// Get the booking ID (it's a UUID string, not integer)
-				const bookingResult = await db
-					.prepare('SELECT id FROM bookings WHERE google_event_id = ? OR outlook_event_id = ? OR (user_id = ? AND start_time = ? AND attendee_email = ?)')
-					.bind(googleEventId, outlookEventId, user.id, startTime, attendeeEmail)
-					.first<{ id: string }>();
-				const bookingId = bookingResult?.id || result.meta.last_row_id?.toString() || '';
 
 				// Get email templates to check if confirmation is enabled
 				const templates = await getEmailTemplates(db, user.id);
@@ -329,7 +409,7 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 
 		return json({
 			success: true,
-			bookingId: result.meta.last_row_id,
+			bookingId,
 			meetingUrl,
 			meetingType: inviteCalendar === 'outlook' ? 'teams' : 'google_meet'
 		});
